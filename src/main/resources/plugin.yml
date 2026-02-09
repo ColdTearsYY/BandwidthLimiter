@@ -1,0 +1,36 @@
+# BandwidthLimiter - 玩家带宽限制插件
+# 兼容 Folia 1.21.1 / Paper / Spigot
+
+name: BandwidthLimiter
+version: '1.0.0'
+main: com.bandwidthlimiter.BandwidthLimiterPlugin
+api-version: '1.21'
+description: '控制每个玩家的网络带宽上限'
+author: BandwidthLimiter
+website: ''
+
+# Folia 兼容标记
+folia-supported: true
+
+# 命令定义
+commands:
+  bandwidthlimiter:
+    description: BandwidthLimiter 管理命令
+    usage: /bandwidthlimiter <子命令>
+    aliases:
+      - bwl
+      - bandwidth
+
+# 权限定义
+permissions:
+  bandwidthlimiter.admin:
+    description: 允许使用 BandwidthLimiter 管理命令
+    default: op
+
+  bandwidthlimiter.bypass:
+    description: 绕过带宽限制
+    default: false
+
+  bandwidthlimiter.info:
+    description: 允许查看自己的带宽信息
+    default: true
