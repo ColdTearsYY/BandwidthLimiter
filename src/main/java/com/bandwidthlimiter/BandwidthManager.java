@@ -3,6 +3,7 @@ package com.bandwidthlimiter;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelPipeline;
 import org.bukkit.Bukkit;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.entity.Player;
 
@@ -12,334 +13,320 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * 带宽管理器 - 负责管理所有玩家的带宽限制
- * 通过反射获取玩家的 Netty Channel，注入自定义的流量整形处理器
- */
-public class BandwidthManager {
+/** Manages per-player Netty traffic shaping handlers. */
+public final class BandwidthManager {
+
+    private static final String HANDLER_NAME = "bandwidth_limiter";
+    private static final long CHECK_INTERVAL_MILLIS = 1_000L;
 
     private final BandwidthLimiterPlugin plugin;
+    private final Map<UUID, Boolean> injectionPending = new ConcurrentHashMap<>();
     private final Map<UUID, PlayerBandwidthHandler> handlers = new ConcurrentHashMap<>();
+    private final Map<UUID, Channel> channels = new ConcurrentHashMap<>();
     private final Map<UUID, Long> playerLimits = new ConcurrentHashMap<>();
-
-    private long defaultLimitKBps = 512; // 默认 512 KB/s
-    private static final String HANDLER_NAME = "bandwidth_limiter";
+    private volatile long defaultLimitKBps = 512L;
 
     public BandwidthManager(BandwidthLimiterPlugin plugin) {
         this.plugin = plugin;
     }
 
-    /**
-     * 从配置文件加载设置
-     */
     public void loadConfig() {
         plugin.reloadConfig();
         FileConfiguration config = plugin.getConfig();
+        defaultLimitKBps = positiveLimit(config.getLong("default-limit-kbps", 512L), 512L);
 
-        defaultLimitKBps = config.getLong("default-limit-kbps", 512);
-
-        // 加载每个玩家的独立限制
         playerLimits.clear();
-        if (config.isConfigurationSection("player-limits")) {
-            for (String key : config.getConfigurationSection("player-limits").getKeys(false)) {
+        ConfigurationSection section = config.getConfigurationSection("player-limits");
+        if (section != null) {
+            for (String key : section.getKeys(false)) {
+                long limit = positiveLimit(section.getLong(key, -1L), -1L);
+                if (limit <= 0) {
+                    plugin.getLogger().warning("忽略无效的玩家带宽限制: player-limits." + key);
+                    continue;
+                }
                 try {
-                    UUID uuid = UUID.fromString(key);
-                    long limit = config.getLong("player-limits." + key);
-                    playerLimits.put(uuid, limit);
-                } catch (IllegalArgumentException e) {
-                    // 尝试通过玩家名查找
-                    Player p = Bukkit.getPlayerExact(key);
-                    if (p != null) {
-                        long limit = config.getLong("player-limits." + key);
-                        playerLimits.put(p.getUniqueId(), limit);
+                    playerLimits.put(UUID.fromString(key), limit);
+                } catch (IllegalArgumentException ignored) {
+                    Player player = Bukkit.getPlayerExact(key);
+                    if (player != null) {
+                        playerLimits.put(player.getUniqueId(), limit);
+                    } else {
+                        plugin.getLogger().warning("玩家名配置仅在玩家在线时可解析: " + key);
                     }
                 }
             }
         }
 
-        // 更新所有已在线玩家的限制
         for (Player player : Bukkit.getOnlinePlayers()) {
             updatePlayerLimit(player);
         }
-
         plugin.getLogger().info("配置已重新加载 - 默认限制: " + defaultLimitKBps + " KB/s");
     }
 
-    /**
-     * 通过反射获取玩家的 Netty Channel
-     * 兼容 1.21.1 (Paper/Folia)
-     */
+    /** Resolves CraftPlayer -> ServerPlayer -> Connection -> Netty Channel. */
     public Channel getPlayerChannel(Player player) {
         try {
-            // 获取 CraftPlayer -> getHandle() -> ServerPlayer
-            Method getHandle = player.getClass().getMethod("getHandle");
-            Object serverPlayer = getHandle.invoke(player);
-
-            // ServerPlayer -> connection (ServerGamePacketListenerImpl)
-            Object connection = getFieldValue(serverPlayer, "connection");
-            if (connection == null) {
-                // 尝试不同的字段名 (不同版本映射可能不同)
-                connection = getFieldByType(serverPlayer,
-                    "net.minecraft.server.network.ServerGamePacketListenerImpl");
-            }
-
-            if (connection == null) {
-                plugin.getLogger().warning("无法获取玩家 " + player.getName() + " 的连接对象");
+            Object serverPlayer = invokeNoArg(player, "getHandle");
+            if (serverPlayer == null) {
                 return null;
             }
 
-            // ServerGamePacketListenerImpl -> connection (Connection)
-            // 在 1.21.1 中字段名为 "connection" 或通过类型查找
-            Object networkManager = getFieldByType(connection,
+            Object connection = getFieldByTypeName(serverPlayer,
+                "net.minecraft.server.network.ServerGamePacketListenerImpl");
+            if (connection == null) {
+                connection = getFieldValue(serverPlayer, "connection");
+            }
+            if (connection == null) {
+                warnChannelFailure(player, "connection");
+                return null;
+            }
+
+            Object networkConnection = getFieldByTypeName(connection,
                 "net.minecraft.network.Connection");
-
-            if (networkManager == null) {
-                plugin.getLogger().warning("无法获取玩家 " + player.getName() + " 的网络管理器");
+            if (networkConnection == null) {
+                networkConnection = getFieldValue(connection, "connection");
+            }
+            if (networkConnection == null) {
+                warnChannelFailure(player, "network connection");
                 return null;
             }
 
-            // Connection -> channel (io.netty.channel.Channel)
-            Object channel = getFieldByType(networkManager, "io.netty.channel.Channel");
-            if (channel == null) {
-                // 直接查找名为 "channel" 的字段
-                channel = getFieldValue(networkManager, "channel");
+            Object channel = getFieldByTypeName(networkConnection, Channel.class.getName());
+            if (!(channel instanceof Channel)) {
+                channel = getFieldValue(networkConnection, "channel");
             }
-
+            if (!(channel instanceof Channel)) {
+                warnChannelFailure(player, "Netty channel");
+                return null;
+            }
             return (Channel) channel;
-
-        } catch (Exception e) {
-            plugin.getLogger().severe("获取玩家 " + player.getName() + " 的 Channel 失败: " + e.getMessage());
-            e.printStackTrace();
+        } catch (Exception exception) {
+            plugin.getLogger().warning("获取玩家 " + player.getName() + " 的 Channel 失败: "
+                + exception.getClass().getSimpleName() + ": " + exception.getMessage());
             return null;
         }
     }
 
-    /**
-     * 为玩家注入带宽限制处理器
-     */
     public void injectPlayer(Player player) {
-        if (player.hasPermission("bandwidthlimiter.bypass")) {
-            plugin.getLogger().info("玩家 " + player.getName() + " 拥有绕过权限，跳过注入");
+        UUID uuid = player.getUniqueId();
+        if (!player.isOnline() || player.hasPermission("bandwidthlimiter.bypass")) {
+            removePlayer(player);
             return;
         }
 
         Channel channel = getPlayerChannel(player);
-        if (channel == null) {
+        if (channel == null || !channel.isOpen()) {
             return;
         }
+        channels.put(uuid, channel);
+        if (injectionPending.putIfAbsent(uuid, Boolean.TRUE) != null) {
+            return;
+        }
+        long limitBps = toBytesPerSecond(getPlayerLimit(player));
 
-        long limitKBps = getPlayerLimit(player);
-        long limitBps = limitKBps * 1024; // 转换为 Bytes/s
-
-        // 在 Channel 的 EventLoop 中操作，确保线程安全
         channel.eventLoop().execute(() -> {
             try {
+                if (!channel.isOpen()) {
+                    return;
+                }
                 ChannelPipeline pipeline = channel.pipeline();
-
-                // 如果已存在，先移除
-                if (pipeline.get(HANDLER_NAME) != null) {
+                Object existing = pipeline.get(HANDLER_NAME);
+                if (existing instanceof PlayerBandwidthHandler) {
+                    handlers.put(uuid, (PlayerBandwidthHandler) existing);
+                    return;
+                }
+                if (existing != null) {
                     pipeline.remove(HANDLER_NAME);
                 }
 
-                // 创建并添加带宽限制处理器
-                // writeLimit: 出站限制 (服务器->客户端)
-                // readLimit: 入站限制 (客户端->服务器), 0 = 不限制
+                String anchor = findOutboundAnchor(pipeline);
+                if (anchor == null) {
+                    plugin.getLogger().warning("玩家 " + player.getName()
+                        + " 的出站编码器尚未就绪，稍后重试");
+                    return;
+                }
+
+                // Outbound events travel tail -> head. Before the encoder means
+                // the shaper receives the encoded ByteBuf, not the raw Packet.
                 PlayerBandwidthHandler handler = new PlayerBandwidthHandler(
-                    player.getUniqueId(),
-                    0,          // 不限制入站 (客户端->服务器)
-                    limitBps,   // 限制出站 (服务器->客户端)
-                    1000        // 检查间隔 1 秒
-                );
-
-                // 在 encoder 之后添加，这样可以限制编码后的实际字节流
-                if (pipeline.get("encoder") != null) {
-                    pipeline.addAfter("encoder", HANDLER_NAME, handler);
-                } else {
-                    // 找不到 encoder，添加到最前面
-                    pipeline.addFirst(HANDLER_NAME, handler);
-                }
-
-                handlers.put(player.getUniqueId(), handler);
-
+                    uuid, 0L, limitBps, CHECK_INTERVAL_MILLIS);
+                pipeline.addBefore(anchor, HANDLER_NAME, handler);
+                handlers.put(uuid, handler);
                 plugin.getLogger().info("已为玩家 " + player.getName()
-                    + " 注入带宽限制: " + limitKBps + " KB/s");
-
-            } catch (Exception e) {
-                plugin.getLogger().severe("注入玩家 " + player.getName()
-                    + " 的带宽限制处理器失败: " + e.getMessage());
+                    + " 注入带宽限制: " + getPlayerLimit(player) + " KB/s");
+            } catch (RuntimeException exception) {
+                plugin.getLogger().warning("注入玩家 " + player.getName()
+                    + " 的带宽处理器失败: " + exception.getMessage());
+            } finally {
+                injectionPending.remove(uuid);
             }
         });
     }
 
-    /**
-     * 移除玩家的带宽限制处理器
-     */
     public void removePlayer(Player player) {
-        PlayerBandwidthHandler handler = handlers.remove(player.getUniqueId());
-        if (handler == null) return;
-
-        Channel channel = getPlayerChannel(player);
-        if (channel == null) return;
-
+        UUID uuid = player.getUniqueId();
+        injectionPending.remove(uuid);
+        PlayerBandwidthHandler handler = handlers.remove(uuid);
+        Channel channel = channels.remove(uuid);
+        if (handler == null || channel == null || !channel.isOpen()) {
+            return;
+        }
         channel.eventLoop().execute(() -> {
             try {
-                ChannelPipeline pipeline = channel.pipeline();
-                if (pipeline.get(HANDLER_NAME) != null) {
-                    pipeline.remove(HANDLER_NAME);
-                    plugin.getLogger().info("已移除玩家 " + player.getName() + " 的带宽限制");
+                if (channel.pipeline().get(HANDLER_NAME) != null) {
+                    channel.pipeline().remove(HANDLER_NAME);
                 }
-            } catch (Exception e) {
-                // 玩家可能已断开，忽略错误
+            } catch (RuntimeException ignored) {
+                // The channel may be closing concurrently.
             }
         });
     }
 
-    /**
-     * 更新玩家的带宽限制
-     */
     public void updatePlayerLimit(Player player) {
-        PlayerBandwidthHandler handler = handlers.get(player.getUniqueId());
-        if (handler != null) {
-            long limitKBps = getPlayerLimit(player);
-            long limitBps = limitKBps * 1024;
-            handler.setWriteLimit(limitBps);
-            handler.setReadLimit(0);
-            plugin.getLogger().info("已更新玩家 " + player.getName()
-                + " 的带宽限制为: " + limitKBps + " KB/s");
-        } else {
-            // 如果处理器不存在，尝试重新注入
-            injectPlayer(player);
+        if (player.hasPermission("bandwidthlimiter.bypass")) {
+            removePlayer(player);
+            return;
         }
+        PlayerBandwidthHandler handler = handlers.get(player.getUniqueId());
+        Channel channel = channels.get(player.getUniqueId());
+        if (handler == null || channel == null || !channel.isOpen()) {
+            injectPlayer(player);
+            return;
+        }
+        long limitBps = toBytesPerSecond(getPlayerLimit(player));
+        channel.eventLoop().execute(() -> handler.setWriteLimit(limitBps));
     }
 
-    /**
-     * 设置特定玩家的带宽限制 (KB/s)
-     */
     public void setPlayerLimit(UUID uuid, long limitKBps) {
+        if (limitKBps <= 0) {
+            throw new IllegalArgumentException("带宽限制必须大于 0");
+        }
         playerLimits.put(uuid, limitKBps);
-
-        // 保存到配置
-        plugin.getConfig().set("player-limits." + uuid.toString(), limitKBps);
+        plugin.getConfig().set("player-limits." + uuid, limitKBps);
         plugin.saveConfig();
-
-        // 如果玩家在线，立即更新
         Player player = Bukkit.getPlayer(uuid);
         if (player != null && player.isOnline()) {
             updatePlayerLimit(player);
         }
     }
 
-    /**
-     * 移除特定玩家的独立限制 (恢复使用默认值)
-     */
     public void removePlayerLimit(UUID uuid) {
         playerLimits.remove(uuid);
-        plugin.getConfig().set("player-limits." + uuid.toString(), null);
+        plugin.getConfig().set("player-limits." + uuid, null);
         plugin.saveConfig();
-
         Player player = Bukkit.getPlayer(uuid);
         if (player != null && player.isOnline()) {
             updatePlayerLimit(player);
         }
     }
 
-    /**
-     * 获取玩家的带宽限制 (KB/s)
-     */
     public long getPlayerLimit(Player player) {
         return playerLimits.getOrDefault(player.getUniqueId(), defaultLimitKBps);
     }
 
-    /**
-     * 获取玩家的当前出站速率 (bytes/s)
-     */
     public long getPlayerCurrentRate(Player player) {
         PlayerBandwidthHandler handler = handlers.get(player.getUniqueId());
-        if (handler != null) {
-            return handler.trafficCounter().lastWrittenBytes();
-        }
-        return -1;
+        return handler == null ? -1L : handler.getCurrentWriteRate();
     }
 
-    /**
-     * 获取默认限制
-     */
     public long getDefaultLimit() {
         return defaultLimitKBps;
     }
 
-    /**
-     * 设置默认限制
-     */
     public void setDefaultLimit(long limitKBps) {
-        this.defaultLimitKBps = limitKBps;
+        if (limitKBps <= 0) {
+            throw new IllegalArgumentException("带宽限制必须大于 0");
+        }
+        defaultLimitKBps = limitKBps;
         plugin.getConfig().set("default-limit-kbps", limitKBps);
         plugin.saveConfig();
     }
 
-    /**
-     * 移除所有处理器
-     */
     public void removeAllHandlers() {
         for (Player player : Bukkit.getOnlinePlayers()) {
             removePlayer(player);
         }
+        injectionPending.clear();
         handlers.clear();
+        channels.clear();
     }
 
-    /**
-     * 检查玩家是否有带宽处理器
-     */
     public boolean hasHandler(Player player) {
         return handlers.containsKey(player.getUniqueId());
     }
 
-    // === 反射工具方法 ===
-
-    private Object getFieldValue(Object obj, String fieldName) {
-        try {
-            Class<?> clazz = obj.getClass();
-            while (clazz != null) {
-                try {
-                    Field field = clazz.getDeclaredField(fieldName);
-                    field.setAccessible(true);
-                    return field.get(obj);
-                } catch (NoSuchFieldException e) {
-                    clazz = clazz.getSuperclass();
-                }
-            }
-        } catch (Exception e) {
-            // ignore
+    private String findOutboundAnchor(ChannelPipeline pipeline) {
+        if (pipeline.get("encoder") != null) {
+            return "encoder";
+        }
+        if (pipeline.get("outbound_config") != null) {
+            return "outbound_config";
         }
         return null;
     }
 
-    private Object getFieldByType(Object obj, String typeName) {
+    private long toBytesPerSecond(long limitKBps) {
         try {
-            Class<?> clazz = obj.getClass();
-            while (clazz != null) {
-                for (Field field : clazz.getDeclaredFields()) {
-                    if (isAssignableFrom(field.getType(), typeName)) {
+            return Math.multiplyExact(limitKBps, 1024L);
+        } catch (ArithmeticException exception) {
+            return Long.MAX_VALUE;
+        }
+    }
+
+    private long positiveLimit(long value, long fallback) {
+        return value > 0 ? value : fallback;
+    }
+
+    private void warnChannelFailure(Player player, String part) {
+        plugin.getLogger().warning("无法获取玩家 " + player.getName() + " 的 " + part);
+    }
+
+    private Object invokeNoArg(Object object, String methodName) throws ReflectiveOperationException {
+        Method method = object.getClass().getMethod(methodName);
+        return method.invoke(object);
+    }
+
+    private Object getFieldValue(Object object, String fieldName) {
+        for (Class<?> type = object.getClass(); type != null; type = type.getSuperclass()) {
+            try {
+                Field field = type.getDeclaredField(fieldName);
+                field.setAccessible(true);
+                return field.get(object);
+            } catch (NoSuchFieldException ignored) {
+                // Search the superclass.
+            } catch (ReflectiveOperationException | RuntimeException exception) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private Object getFieldByTypeName(Object object, String typeName) {
+        for (Class<?> type = object.getClass(); type != null; type = type.getSuperclass()) {
+            for (Field field : type.getDeclaredFields()) {
+                if (isAssignableToName(field.getType(), typeName)) {
+                    try {
                         field.setAccessible(true);
-                        return field.get(obj);
+                        return field.get(object);
+                    } catch (ReflectiveOperationException | RuntimeException ignored) {
+                        return null;
                     }
                 }
-                clazz = clazz.getSuperclass();
             }
-        } catch (Exception e) {
-            // ignore
         }
         return null;
     }
 
-    private boolean isAssignableFrom(Class<?> type, String targetName) {
-        Class<?> current = type;
-        while (current != null) {
-            if (current.getName().equals(targetName)) return true;
-            for (Class<?> iface : current.getInterfaces()) {
-                if (iface.getName().equals(targetName)) return true;
+    private boolean isAssignableToName(Class<?> type, String targetName) {
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            if (current.getName().equals(targetName)) {
+                return true;
             }
-            current = current.getSuperclass();
+            for (Class<?> iface : current.getInterfaces()) {
+                if (iface.getName().equals(targetName)) {
+                    return true;
+                }
+            }
         }
         return false;
     }

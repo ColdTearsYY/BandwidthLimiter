@@ -7,14 +7,15 @@
 
     <groupId>com.bandwidthlimiter</groupId>
     <artifactId>BandwidthLimiter</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
     <packaging>jar</packaging>
 
     <name>BandwidthLimiter</name>
-    <description>控制每个玩家的网络带宽上限 - 兼容 Folia 1.21.1</description>
-
+    <description>控制每个玩家的网络带宽上限 - 兼容 Paper/Folia 26.3</description>
     <properties>
-        <java.version>21</java.version>
+        <java.version>25</java.version>
+        <paper.version>26.3.build.32-alpha</paper.version>
+        <netty.version>4.2.16.Final</netty.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
 
@@ -34,7 +35,7 @@
         <dependency>
             <groupId>io.papermc.paper</groupId>
             <artifactId>paper-api</artifactId>
-            <version>1.21.1-R0.1-SNAPSHOT</version>
+            <version>${paper.version}</version>
             <scope>provided</scope>
         </dependency>
 
@@ -42,7 +43,7 @@
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-handler</artifactId>
-            <version>4.1.97.Final</version>
+            <version>${netty.version}</version>
             <scope>provided</scope>
         </dependency>
     </dependencies>
@@ -52,7 +53,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.11.0</version>
+                <version>3.14.1</version>
                 <configuration>
                     <source>${java.version}</source>
                     <target>${java.version}</target>

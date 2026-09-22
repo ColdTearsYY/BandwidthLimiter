@@ -11,7 +11,7 @@
 | 功能 | 说明 |
 |------|------|
 | 🔒 **每玩家带宽限制** | 为每位玩家独立设置带宽上限 (KB/s)，使用 Netty 的 `ChannelTrafficShapingHandler` 实现真实的出站流量限制 |
-| 🌿 **Folia 原生兼容** | 使用 Folia 的 `RegionScheduler` API，完美兼容 Folia 1.21.1 的多线程区域化架构，同时向下兼容 Paper/Spigot |
+| 🌿 **Folia/Paper 兼容** | 使用 Paper/Folia 调度 API；Paper 26.3 已完成编译适配，运行时需使用对应的 Paper/Folia 构建 |
 | ⚡ **实时热更新** | 修改配置或使用命令后即时生效，无需重启服务器。支持运行时动态调整每位玩家的带宽限制 |
 | 📊 **带宽监控** | 实时查看每位玩家当前的出站带宽使用情况，通过命令随时监控服务器网络状态 |
 | 🛡️ **权限系统** | 完善的权限节点设计，支持绕过带宽限制、管理员命令等多级权限控制 |
@@ -87,8 +87,8 @@ player-limits:
 
 ### 环境要求
 
-- **Java** 21 或更高版本
-- **服务端** Folia 1.21.1 / Paper 1.21.1 / Spigot 1.21.1
+- **Java** 25 或更高版本
+- **服务端** Paper 26.3（`paper-26.3-32`）或与 API 兼容的 Paper/Folia 构建
 - **无前置插件**依赖（不需要 ProtocolLib 等）
 
 ### 从源码构建
@@ -99,11 +99,11 @@ cd BandwidthLimiter
 mvn clean package
 ```
 
-编译产物位于 `target/BandwidthLimiter-1.0.0.jar`。
+编译产物位于 `target/BandwidthLimiter-1.1.0.jar`。
 
 ### 安装到服务器
 
-1. 将 `BandwidthLimiter-1.0.0.jar` 放入服务器的 `plugins/` 目录
+1. 将 `BandwidthLimiter-1.1.0.jar` 放入服务器的 `plugins/` 目录
 2. 启动（或重启）服务器，插件会自动生成默认配置文件
 3. 根据需要修改 `plugins/BandwidthLimiter/config.yml`，使用 `/bwl reload` 热更新
 

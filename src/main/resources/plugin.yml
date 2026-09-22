@@ -1,10 +1,10 @@
 # BandwidthLimiter - 玩家带宽限制插件
-# 兼容 Folia 1.21.1 / Paper / Spigot
+# 兼容 Paper/Folia 26.3
 
 name: BandwidthLimiter
-version: '1.0.0'
+version: '1.1.0'
 main: com.bandwidthlimiter.BandwidthLimiterPlugin
-api-version: '1.21'
+api-version: '26.3'
 description: '控制每个玩家的网络带宽上限'
 author: BandwidthLimiter
 website: ''

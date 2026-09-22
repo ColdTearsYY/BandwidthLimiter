@@ -84,7 +84,7 @@ public class BandwidthCommand implements CommandExecutor, TabCompleter {
 
     private void handleSet(CommandSender sender, String[] args, BandwidthManager manager) {
         if (args.length < 3) {
-            sender.sendMessage(PREFIX + ChatColor.RED + "用法: /bwl set <玩家> ");
+            sender.sendMessage(PREFIX + ChatColor.RED + "用法: /bwl set <玩家> <KB/s>");
             return;
         }
 
@@ -245,7 +245,7 @@ public class BandwidthCommand implements CommandExecutor, TabCompleter {
 
     private void sendHelp(CommandSender sender) {
         sender.sendMessage(PREFIX + ChatColor.AQUA + "=== BandwidthLimiter 帮助 ===");
-        sender.sendMessage(PREFIX + ChatColor.YELLOW + "/bwl set <玩家> "
+        sender.sendMessage(PREFIX + ChatColor.YELLOW + "/bwl set <玩家> <KB/s>"
             + ChatColor.GRAY + " - 设置带宽限制");
         sender.sendMessage(PREFIX + ChatColor.YELLOW + "/bwl remove <玩家>"
             + ChatColor.GRAY + " - 移除独立限制");
