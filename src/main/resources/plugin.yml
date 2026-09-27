@@ -2,7 +2,7 @@
 # 兼容 Paper/Folia 26.3
 
 name: BandwidthLimiter
-version: '1.1.0'
+version: '1.2.0'
 main: com.bandwidthlimiter.BandwidthLimiterPlugin
 api-version: '26.3'
 description: '控制每个玩家的网络带宽上限'

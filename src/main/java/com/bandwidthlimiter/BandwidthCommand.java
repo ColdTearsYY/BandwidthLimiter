@@ -23,6 +23,7 @@ import java.util.stream.Collectors;
  *   /bwl default <KB/s>          - 设置默认带宽限制
  *   /bwl list                     - 列出所有在线玩家的带宽状态
  *   /bwl reload                   - 重新加载配置
+ *   /bwl usage [玩家|reset]       - 查看玩家流量用量 / 重置统计
  */
 public class BandwidthCommand implements CommandExecutor, TabCompleter {
 
@@ -72,6 +73,11 @@ public class BandwidthCommand implements CommandExecutor, TabCompleter {
 
             case "reload":
                 handleReload(sender, manager);
+                break;
+
+            case "usage":
+            case "stats":
+                handleUsage(sender, args, manager);
                 break;
 
             default:
@@ -243,6 +249,79 @@ public class BandwidthCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage(PREFIX + ChatColor.GREEN + "配置已重新加载！");
     }
 
+    private void handleUsage(CommandSender sender, String[] args, BandwidthManager manager) {
+        // /bwl usage            -> 排行
+        // /bwl usage <玩家>      -> 指定玩家
+        // /bwl usage reset [玩家] -> 清零
+        if (args.length >= 2 && args[1].equalsIgnoreCase("reset")) {
+            if (args.length >= 3) {
+                Player target = Bukkit.getPlayerExact(args[2]);
+                java.util.UUID uuid = target != null ? target.getUniqueId()
+                    : parseUuidOrOnline(args[2]);
+                manager.resetUsage(uuid);
+                sender.sendMessage(PREFIX + ChatColor.GREEN + "已重置玩家 " + args[2] + " 的流量统计");
+            } else {
+                manager.resetUsage(null);
+                sender.sendMessage(PREFIX + ChatColor.GREEN + "已重置全部玩家的流量统计");
+            }
+            return;
+        }
+
+        if (args.length >= 2) {
+            Player target = Bukkit.getPlayerExact(args[1]);
+            java.util.UUID uuid = target != null ? target.getUniqueId() : parseUuidOrOnline(args[1]);
+            if (uuid == null) {
+                sender.sendMessage(PREFIX + ChatColor.RED + "未找到玩家: " + args[1]);
+                return;
+            }
+            String name = target != null ? target.getName() : args[1];
+            long bytes = manager.getPlayerTotalBytes(uuid);
+            long rate = target != null ? manager.getPlayerCurrentRate(target) : -1L;
+            sender.sendMessage(PREFIX + ChatColor.AQUA + "=== " + name + " 流量用量 ===");
+            sender.sendMessage(PREFIX + "累计出站: " + ChatColor.YELLOW
+                + BandwidthManager.humanReadableByteCount(bytes)
+                + ChatColor.GRAY + " (" + bytes + " B)");
+            if (rate >= 0) {
+                sender.sendMessage(PREFIX + "当前速率: " + ChatColor.GREEN
+                    + BandwidthManager.humanReadableByteCount(rate) + "/s");
+            }
+            return;
+        }
+
+        // 排行
+        java.util.Map<java.util.UUID, Long> ranking = manager.getUsageRanking();
+        sender.sendMessage(PREFIX + ChatColor.AQUA + "=== 玩家流量用量排行 ===");
+        if (ranking.isEmpty()) {
+            sender.sendMessage(PREFIX + ChatColor.GRAY + "暂无流量记录");
+            return;
+        }
+        long total = ranking.values().stream().mapToLong(Long::longValue).sum();
+        sender.sendMessage(PREFIX + "全服累计: " + ChatColor.YELLOW
+            + BandwidthManager.humanReadableByteCount(total));
+        int rank = 0;
+        for (java.util.Map.Entry<java.util.UUID, Long> e : ranking.entrySet()) {
+            if (++rank > 10) break;
+            Player p = Bukkit.getPlayer(e.getKey());
+            org.bukkit.OfflinePlayer off = p != null ? p : Bukkit.getOfflinePlayer(e.getKey());
+            String name = off.getName() != null ? off.getName() : e.getKey().toString();
+            String online = p != null && p.isOnline() ? ChatColor.GREEN + "●" : ChatColor.GRAY + "○";
+            sender.sendMessage(PREFIX + online + " " + ChatColor.WHITE + "#" + rank + " " + name
+                + ChatColor.GRAY + " - " + ChatColor.YELLOW
+                + BandwidthManager.humanReadableByteCount(e.getValue()));
+        }
+    }
+
+    private java.util.UUID parseUuidOrOnline(String name) {
+        try {
+            return java.util.UUID.fromString(name);
+        } catch (IllegalArgumentException ignored) {
+            Player p = Bukkit.getPlayerExact(name);
+            if (p != null) return p.getUniqueId();
+            org.bukkit.OfflinePlayer off = Bukkit.getOfflinePlayer(name);
+            return off.hasPlayedBefore() || off.isOnline() ? off.getUniqueId() : null;
+        }
+    }
+
     private void sendHelp(CommandSender sender) {
         sender.sendMessage(PREFIX + ChatColor.AQUA + "=== BandwidthLimiter 帮助 ===");
         sender.sendMessage(PREFIX + ChatColor.YELLOW + "/bwl set <玩家> <KB/s>"
@@ -257,6 +336,8 @@ public class BandwidthCommand implements CommandExecutor, TabCompleter {
             + ChatColor.GRAY + " - 列出所有玩家状态");
         sender.sendMessage(PREFIX + ChatColor.YELLOW + "/bwl reload"
             + ChatColor.GRAY + " - 重新加载配置");
+        sender.sendMessage(PREFIX + ChatColor.YELLOW + "/bwl usage [玩家|reset]"
+            + ChatColor.GRAY + " - 查看流量用量排行/单人/重置");
     }
 
     @Override
@@ -267,14 +348,15 @@ public class BandwidthCommand implements CommandExecutor, TabCompleter {
 
         if (args.length == 1) {
             return filterCompletions(
-                Arrays.asList("set", "remove", "info", "default", "list", "reload"),
+                Arrays.asList("set", "remove", "info", "default", "list", "reload", "usage", "stats"),
                 args[0]
             );
         }
 
         if (args.length == 2) {
             String sub = args[0].toLowerCase();
-            if (sub.equals("set") || sub.equals("remove") || sub.equals("info") || sub.equals("check")) {
+            if (sub.equals("set") || sub.equals("remove") || sub.equals("info")
+                || sub.equals("check") || sub.equals("usage") || sub.equals("stats")) {
                 return filterCompletions(
                     Bukkit.getOnlinePlayers().stream()
                         .map(Player::getName)

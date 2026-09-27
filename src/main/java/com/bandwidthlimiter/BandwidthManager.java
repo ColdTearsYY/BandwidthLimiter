@@ -12,6 +12,8 @@ import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.stream.Collectors;
 
 /** Manages per-player Netty traffic shaping handlers. */
 public final class BandwidthManager {
@@ -24,6 +26,10 @@ public final class BandwidthManager {
     private final Map<UUID, PlayerBandwidthHandler> handlers = new ConcurrentHashMap<>();
     private final Map<UUID, Channel> channels = new ConcurrentHashMap<>();
     private final Map<UUID, Long> playerLimits = new ConcurrentHashMap<>();
+    // 每玩家累计出站流量 (bytes)，参考 BandwidthSaver-PE 的 LongAdder 统计思路
+    private final Map<UUID, LongAdder> totalOutboundBytes = new ConcurrentHashMap<>();
+    // 记录注入时 handler 的累计基线，用于移除时结算增量
+    private final Map<UUID, Long> sessionBaseline = new ConcurrentHashMap<>();
     private volatile long defaultLimitKBps = 512L;
 
     public BandwidthManager(BandwidthLimiterPlugin plugin) {
@@ -152,6 +158,9 @@ public final class BandwidthManager {
                     uuid, 0L, limitBps, CHECK_INTERVAL_MILLIS);
                 pipeline.addBefore(anchor, HANDLER_NAME, handler);
                 handlers.put(uuid, handler);
+                // 统计基线: 记录注入时的累计字节数，便于移除时结算本会话增量
+                sessionBaseline.put(uuid, handler.getTotalWritten());
+                totalOutboundBytes.computeIfAbsent(uuid, k -> new LongAdder());
                 plugin.getLogger().info("已为玩家 " + player.getName()
                     + " 注入带宽限制: " + getPlayerLimit(player) + " KB/s");
             } catch (RuntimeException exception) {
@@ -168,6 +177,13 @@ public final class BandwidthManager {
         injectionPending.remove(uuid);
         PlayerBandwidthHandler handler = handlers.remove(uuid);
         Channel channel = channels.remove(uuid);
+        // 结算本会话流量: 即使 channel 已关闭，handler 的累计计数仍可读
+        if (handler != null) {
+            Long baselineObj = sessionBaseline.remove(uuid);
+            long baseline = baselineObj == null ? 0L : baselineObj;
+            long sessionBytes = Math.max(0L, handler.getTotalWritten() - baseline);
+            totalOutboundBytes.computeIfAbsent(uuid, k -> new LongAdder()).add(sessionBytes);
+        }
         if (handler == null || channel == null || !channel.isOpen()) {
             return;
         }
@@ -253,6 +269,69 @@ public final class BandwidthManager {
 
     public boolean hasHandler(Player player) {
         return handlers.containsKey(player.getUniqueId());
+    }
+
+    /** 结算所有在线玩家当前会话的累计流量（供周期采样/查询时调用）。 */
+    public void settleActiveSessions() {
+        for (Map.Entry<UUID, PlayerBandwidthHandler> entry : handlers.entrySet()) {
+            UUID uuid = entry.getKey();
+            PlayerBandwidthHandler handler = entry.getValue();
+            Long baselineObj = sessionBaseline.get(uuid);
+            long baseline = baselineObj == null ? 0L : baselineObj;
+            long total = handler.getTotalWritten();
+            long delta = Math.max(0L, total - baseline);
+            if (delta > 0) {
+                totalOutboundBytes.computeIfAbsent(uuid, k -> new LongAdder()).add(delta);
+                sessionBaseline.put(uuid, total);
+            }
+        }
+    }
+
+    /** 获取玩家累计出站流量 (bytes)，含历史会话与当前未结算部分。 */
+    public long getPlayerTotalBytes(UUID uuid) {
+        long settled = totalOutboundBytes.containsKey(uuid) ? totalOutboundBytes.get(uuid).sum() : 0L;
+        PlayerBandwidthHandler handler = handlers.get(uuid);
+        if (handler != null) {
+            Long baselineObj = sessionBaseline.get(uuid);
+            long baseline = baselineObj == null ? 0L : baselineObj;
+            settled += Math.max(0L, handler.getTotalWritten() - baseline);
+        }
+        return settled;
+    }
+
+    /** 获取所有已记录玩家的流量排行（按累计字节降序）。 */
+    public Map<UUID, Long> getUsageRanking() {
+        settleActiveSessions();
+        return totalOutboundBytes.entrySet().stream()
+            .collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().sum()))
+            .entrySet().stream()
+            .sorted(Map.Entry.<UUID, Long>comparingByValue().reversed())
+            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue,
+                (a, b) -> a, java.util.LinkedHashMap::new));
+    }
+
+    /** 重置指定玩家或全部玩家的流量统计。 */
+    public void resetUsage(UUID uuid) {
+        if (uuid == null) {
+            totalOutboundBytes.clear();
+            for (Map.Entry<UUID, PlayerBandwidthHandler> e : handlers.entrySet()) {
+                sessionBaseline.put(e.getKey(), e.getValue().getTotalWritten());
+            }
+        } else {
+            totalOutboundBytes.remove(uuid);
+            PlayerBandwidthHandler handler = handlers.get(uuid);
+            if (handler != null) {
+                sessionBaseline.put(uuid, handler.getTotalWritten());
+            }
+        }
+    }
+
+    /** 人性化字节格式化，参考 BandwidthSaver-PE 的 humanReadableByteCount。 */
+    public static String humanReadableByteCount(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        int exp = (int) (Math.log(bytes) / Math.log(1024));
+        String pre = "KMGTPE".charAt(exp - 1) + "";
+        return String.format("%.2f %sB", bytes / Math.pow(1024, exp), pre);
     }
 
     private String findOutboundAnchor(ChannelPipeline pipeline) {
