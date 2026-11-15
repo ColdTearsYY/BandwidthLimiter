@@ -258,6 +258,10 @@ public class BandwidthCommand implements CommandExecutor, TabCompleter {
                 Player target = Bukkit.getPlayerExact(args[2]);
                 java.util.UUID uuid = target != null ? target.getUniqueId()
                     : parseUuidOrOnline(args[2]);
+                if (uuid == null) {
+                    sender.sendMessage(PREFIX + ChatColor.RED + "未找到玩家: " + args[2] + "，未重置任何统计");
+                    return;
+                }
                 manager.resetUsage(uuid);
                 sender.sendMessage(PREFIX + ChatColor.GREEN + "已重置玩家 " + args[2] + " 的流量统计");
             } else {

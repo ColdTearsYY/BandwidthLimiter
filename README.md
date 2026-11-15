@@ -14,7 +14,7 @@
 | 🌿 **Folia/Paper 兼容** | 使用 Paper/Folia 调度 API；Paper 26.3 已完成编译适配，运行时需使用对应的 Paper/Folia 构建 |
 | ⚡ **实时热更新** | 修改配置或使用命令后即时生效，无需重启服务器。支持运行时动态调整每位玩家的带宽限制 |
 | 📊 **带宽监控** | 实时查看每位玩家当前的出站带宽使用情况，通过命令随时监控服务器网络状态 |
-| 📈 **流量用量统计** | 基于 Netty `TrafficCounter` 累计每位玩家的出站流量 (bytes)，支持排行、单人查询与重置，采用无锁 `LongAdder` 高性能统计 |
+| 📈 **流量用量统计** | 基于 Netty `TrafficCounter` 累计每位玩家的出站字节，支持排行、单人查询与清零；使用 SQLite 本地持久化 |
 | 🛡️ **权限系统** | 完善的权限节点设计，支持绕过带宽限制、管理员命令等多级权限控制 |
 | 📁 **灵活配置** | YAML 配置文件支持全局默认值和每玩家独立限制，支持配置热重载 |
 
@@ -60,7 +60,7 @@ Player Connection Pipeline:
 |----------|------|------|
 | `bandwidthlimiter.admin` | 管理命令权限 | OP |
 | `bandwidthlimiter.bypass` | 绕过带宽限制 | 无 |
-| `bandwidthlimiter.info` | 查看自身带宽信息 | 所有人 |
+| `bandwidthlimiter.info` | 已声明，暂未独立接入命令权限检查；查询仍需要 admin | 所有人 |
 
 ---
 
@@ -85,6 +85,17 @@ player-limits:
 
 修改配置后使用 `/bwl reload` 即可热更新，无需重启服务器。
 
+### 累计流量存储
+
+- 自动创建本地数据库 `plugins/BandwidthLimiter/usage.db`，无需配置数据库服务或安装前置插件。
+- 每个 UUID 保存一条累计字节记录，不保存逐包日志；磁盘占用主要随记录过的玩家数量增长，而不是随累计流量增长。
+- 每 **30 秒**在独立线程中事务保存，仅更新变化的记录；正常停服时等待最后一次保存，启动时恢复累计值。
+- `/bwl usage reset [玩家或UUID]` 同时清零内存统计并立即排队异步保存；`/bwl reload` 不清空统计。
+- 强制结束进程或断电时，最后一次成功提交后的增量可能丢失（正常保存间隔为 30 秒）；磁盘故障或锁冲突会记录错误并在后续保存时重试。
+- 使用 WAL 模式，运行时可能出现 `usage.db-wal` 和 `usage.db-shm`。建议正常停服后备份数据库，不要在运行时只复制主文件。
+- 仅统计已注入限流器的玩家出站数据；bypass 期间不新增统计。该数值不等同网卡流量或运营商计费流量。
+- 1.2.0 的统计仅在内存中，没有旧数据库可迁移；升级后首次开始持久保存。
+
 ---
 
 ## 📦 安装指南
@@ -103,13 +114,15 @@ cd BandwidthLimiter
 mvn clean package
 ```
 
-编译产物位于 `target/BandwidthLimiter-1.1.0.jar`。
+编译产物位于 `target/BandwidthLimiter-1.3.0.jar`，已内置 SQLite JDBC 驱动及其原生库。
 
 ### 安装到服务器
 
-1. 将 `BandwidthLimiter-1.1.0.jar` 放入服务器的 `plugins/` 目录
+1. 将 `BandwidthLimiter-1.3.0.jar` 放入 **Paper/Folia 后端服务器**的 `plugins/` 目录（替换旧版插件，保留数据目录）
 2. 启动（或重启）服务器，插件会自动生成默认配置文件
 3. 根据需要修改 `plugins/BandwidthLimiter/config.yml`，使用 `/bwl reload` 热更新
+
+**不支持安装到 Velocity。** 在 Velocity 网络中，需要安装到希望限流的各个后端；限流的是该后端发往代理的数据，每个后端的 SQLite 数据库与累计统计各自独立，不提供跨后端合并排行。后端与代理之间的压缩、加密及协议开销可能与代理到玩家的链路不同。
 
 ---
 
@@ -124,6 +137,8 @@ BandwidthLimiter/
     │   ├── BandwidthLimiterPlugin.java   # 插件主类，生命周期管理
     │   ├── BandwidthManager.java         # 带宽管理器，反射注入 Netty Handler
     │   ├── PlayerBandwidthHandler.java   # 基于 ChannelTrafficShapingHandler 的流量整形
+    │   ├── UsageTracker.java             # 同步保护的会话结算与统计清零
+    │   ├── SqliteUsageStore.java         # SQLite 异步保存与启动恢复
     │   ├── BandwidthCommand.java         # 命令处理器与 Tab 补全
     │   ├── PlayerListener.java           # 玩家加入/退出事件监听
     │   └── FoliaUtil.java                # Folia/Paper/Spigot 调度器兼容层
